@@ -273,6 +273,16 @@ func (d *Device) SetPullUp(pin uint8, enabled bool) error {
 	return d.updateRegisterBit(pin, v, _GPPUA, _GPPUB)
 }
 
+// SetInverte enables/disables polarity inversion for the specified pin (0-15 range)
+func (d *Device) SetInvert(pin uint8, enabled bool) error {
+	v := uint8(0)
+	if enabled {
+		v = 1
+	}
+
+	return d.updateRegisterBit(pin, v, _IPOLA, _IPOLB)
+}
+
 // WriteGPIOAB sets GPIO AB to specified value
 func (d *Device) WriteGPIOAB(value uint16) error {
 	busLocks[d.bus].Lock()
