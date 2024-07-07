@@ -1,13 +1,19 @@
 /*
-   MCP23017 I2C Library based on Adafruit Arduino Driver
-   https://github.com/adafruit/Adafruit-MCP23017-Arduino-Library/blob/master/Adafruit_MCP23017.cpp
+MCP23017 I2C Library based on Adafruit Arduino Driver
+https://github.com/adafruit/Adafruit-MCP23017-Arduino-Library/blob/master/Adafruit_MCP23017.cpp
 */
 package mcp23017
 
 import (
+	"errors"
 	"fmt"
-	"github.com/racerxdl/go-mcp23017/i2c"
 	"sync"
+
+	"github.com/racerxdl/go-mcp23017/i2c"
+)
+
+var (
+	ErrNoInterrupt = errors.New("no interrupt has triggered")
 )
 
 const (
@@ -40,6 +46,7 @@ const (
 type PinMode uint8
 type PinLevel bool
 type DevicePort uint8
+type PinMask uint16
 
 const (
 	INPUT  PinMode = 0
@@ -122,6 +129,39 @@ func SetDefaultPinMode(mode PinMode) {
 func SetDefaultValues(portA, portB uint8) {
 	defaultValues[_GPIOA] = portA
 	defaultValues[_GPIOB] = portB
+}
+
+// HasPin returns whether this mask contains the given pin.
+func (pm PinMask) HasPin(pin uint8) bool {
+	return pm&(1<<pin) == (1 << pin)
+}
+
+// Pins returns all pins set in the mask.
+func (pm PinMask) Pins() (pins []uint8) {
+	for p := uint8(0); p < 16; p += 1 {
+		if pm.HasPin(p) {
+			pins = append(pins, p)
+		}
+	}
+
+	return pins
+}
+
+// reg returns which ports should be read based on the bits set in the mask.
+// If a register should NOT be read, the corresponding return value is 0.
+func (p PinMask) reg(portA, portB uint8) (a, b uint8) {
+	left := p & 0xFF
+	right := (p >> 8) & 0xFF
+
+	if left != 0 {
+		a = portA
+	}
+
+	if right != 0 {
+		b = portB
+	}
+
+	return a, b
 }
 
 type Device struct {
@@ -373,63 +413,85 @@ func (d *Device) SetupInterrupts(mirroring, openDrain bool, polarity PinLevel) e
 	return nil
 }
 
-// GetLastInterruptPin returns the last pin that triggered a interrupt.
-// In case of any error (or no interrupt triggered) returns INTERR
-func (d *Device) GetLastInterruptPin() uint8 {
-	busLocks[d.bus].Lock()
-	defer busLocks[d.bus].Unlock()
-
-	// Check PortA
-	f, err := d.dev.ReadRegU8(_INTFA)
-	if err != nil {
-		return INTERR
+// EnableInterrupts enables or disables interrupts for a pin.
+func (d *Device) EnableInterrupts(pin uint8, enabled bool) error {
+	v := uint8(0)
+	if enabled {
+		v = 1
 	}
 
-	for i := uint8(0); i < 8; i++ {
-		if bitRead(f, i) > 0 {
-			return i
-		}
-	}
-
-	// Check PortB
-	f, err = d.dev.ReadRegU8(_INTFB)
-	if err != nil {
-		return INTERR
-	}
-
-	for i := uint8(0); i < 8; i++ {
-		if bitRead(f, i) > 0 {
-			return i + 8
-		}
-	}
-
-	return INTERR
+	return d.updateRegisterBit(pin, v, _GPINTENA, _GPINTENB)
 }
 
-// GetLastInterruptPinValue returns the level of the pin that triggered a interrupt by last
-func (d *Device) GetLastInterruptPinValue() (PinLevel, error) {
-	i := d.GetLastInterruptPin()
+// SetInterrupts sets GPINTENA and GPINTENB to the specified value.
+func (d *Device) SetEnabledInterrupts(value uint16) error {
+	busLocks[d.bus].Lock()
+	defer busLocks[d.bus].Unlock()
+
+	return d.dev.WriteRegU16LE(_GPINTENA, value)
+}
+
+// GetInterruptPins returns the pins that triggered a interrupt.
+// If no interrupt has been triggered, this returns `ErrNoInterrupt`.
+func (d *Device) GetInterruptPins() (out PinMask, err error) {
+	busLocks[d.bus].Lock()
+	defer busLocks[d.bus].Unlock()
+
+	mask, err := d.dev.ReadRegU16LE(_INTFA)
+
+	if err != nil {
+		return 0, err
+	}
+
+	if mask == 0 {
+		return 0, ErrNoInterrupt
+	}
+
+	return PinMask(mask), nil
+}
+
+// GetInterruptPinValues returns the values of pins that triggered an interrupt as a mask.
+// If pins 1 and 10 triggered an interrupt and were HIGH, this returns 10000000010.
+// If no interrupt has been triggered, this returns `ErrNoInterrupt`.
+//
+// Invoking this resets the interrupts and allows them to fire again.
+func (d *Device) GetInterruptPinValues() (PinMask, error) {
+	pins, err := d.GetInterruptPins()
+
+	if err != nil {
+		return 0, err
+	}
 
 	busLocks[d.bus].Lock()
 	defer busLocks[d.bus].Unlock()
 
-	if i != INTERR {
-		addr := regForPin(i, _INTCAPA, _INTCAPB)
-		bit := bitForPin(i)
+	// determine which ports we need to query
+	regA, regB := pins.reg(_INTCAPA, _INTCAPB)
 
-		v, err := d.dev.ReadRegU8(addr)
+	// if we need to read both registers, just do a single u16 read and unpack the result.
+	if regA != 0 && regB != 0 {
+		levels, err := d.dev.ReadRegU16LE(regA)
+
 		if err != nil {
-			return LOW, err
+			return 0, err
 		}
 
-		if (v>>bit)&1 > 0 {
-			return HIGH, nil
-		}
-
-		return LOW, nil
+		return pins & PinMask(levels), nil
 	}
 
-	return LOW, fmt.Errorf("no interrupt triggered")
+	reg, shift := regA, uint8(0)
+
+	if regB != 0 {
+		reg, shift = regB, 8
+	}
+
+	levels, err := d.dev.ReadRegU8(reg)
+
+	if err != nil {
+		return 0, err
+	}
+
+	return PinMask(uint16(levels)<<shift) & pins, nil
 }
 
 // Close Closes the device
