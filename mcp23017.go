@@ -223,7 +223,7 @@ func (d *Device) DigitalWrite(pin uint8, level PinLevel) error {
 	defer busLocks[d.bus].Unlock()
 
 	v := uint8(0)
-	if level == LOW { // Inverse Logic
+	if level == HIGH {
 		v = 1
 	}
 
